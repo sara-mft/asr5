@@ -1,6 +1,6 @@
 if self._cfg.enable_diarization:
-            # ── PATCH: Prevent diarization crash on V2 telephony models ──
-            if self._cfg.model.startswith("telephony"):
+            # ── PATCH: Prevent diarization crash on unsupported models ──
+            if self._cfg.model.startswith("telephony") or self._cfg.model == "chirp_2":
                 self.log.warning(
                     "[%s] Model '%s' does not support speaker_diarization in the V2 API. "
                     "Stripping diarization_config entirely to prevent API crash.",
