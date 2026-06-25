@@ -1,13 +1,18 @@
 if self._cfg.phrase_sets:
             from google.cloud.speech_v2.types import cloud_speech as cs
             
-            # The V2 adaptation field is strictly unsupported by telephony models.
+            # ── PATCH: Handle undocumented API combinations and limits ──
             if self._cfg.model.startswith("telephony"):
                 self.log.warning(
                     "[%s] Model '%s' does not support V2 phrase sets. "
-                    "Stripping adaptation entirely to prevent API crash. "
-                    "(Requires V1 API 'speech_contexts' for phrase boosting).",
+                    "Stripping adaptation entirely to prevent API crash.",
                     self.engine_id, self._cfg.model
+                )
+            elif self._cfg.model == "chirp_3" and self._cfg.enable_diarization:
+                self.log.warning(
+                    "[%s] 'chirp_3' cannot combine Diarization and Phrase Sets simultaneously (causes 404). "
+                    "Stripping adaptation to allow Diarization to succeed.",
+                    self.engine_id
                 )
             else:
                 adaptation_phrase_sets = []
@@ -32,5 +37,4 @@ if self._cfg.phrase_sets:
                             )
                         )
                     )
-                # Only attach the adaptation block for models that actually support V2 adaptation
                 kwargs["adaptation"] = cs.SpeechAdaptation(phrase_sets=adaptation_phrase_sets)
