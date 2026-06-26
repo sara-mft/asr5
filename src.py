@@ -1,197 +1,362 @@
 """
-models.py — Result & Metrics Data Models  [v2]
-===============================================
-Immutable dataclasses that represent a single transcription attempt and its
-evaluated metrics.
-
-
+reporters.py — Output Formatters
+========================================
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
-from typing import Any
+import abc
+import csv
+import json
+import logging
+import random
+from collections import defaultdict
+from pathlib import Path
+from typing import Sequence
 
+from models import TranscriptionResult
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Diarization
-# ──────────────────────────────────────────────────────────────────────────────
+log = logging.getLogger(__name__)
 
-
-@dataclass
-class DiarizationSegment:
-    """One time-aligned, speaker-attributed chunk of speech."""
-
-    speaker: str
-    start_sec: float
-    end_sec: float
-    text: str
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-    @property
-    def duration_sec(self) -> float:
-        return max(0.0, self.end_sec - self.start_sec)
-
-    def format_line(self) -> str:
-        """[00:01.4 - 00:03.7]  SPEAKER_00: Hello there."""
-        def _fmt(t: float) -> str:
-            m, s = divmod(t, 60)
-            return f"{int(m):02d}:{s:04.1f}"
-        return f"[{_fmt(self.start_sec)} - {_fmt(self.end_sec)}]  {self.speaker}: {self.text}"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Metrics
+# Base class
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-@dataclass
-class TranscriptionMetrics:
-    """
-    Per-file metrics computed after a transcription attempt.
-
-    All accuracy fields are None when no reference transcript is available.
-    A value of None is semantically distinct from 0.0 ("not computed" vs
-    "computed and equal to zero").
-
-    Standard metrics (always computed when reference is present)
-    -----------------------------------------------------------
-    latency_sec             Wall-clock seconds from request start to result.
-    audio_duration_sec      Duration of the source audio file in seconds.
-    real_time_factor        latency_sec / audio_duration_sec (< 1 = faster than real-time).
-    word_error_rate         WER ∈ [0, ∞).
-    word_accuracy           max(0, 1 − WER).
-    character_error_rate    CER ∈ [0, ∞).
-    insertions / deletions / substitutions  Edit-distance breakdown.
-    match_error_rate        MER — symmetric WER normalised by max(|ref|, |hyp|).
-    word_info_preserved     WIP ∈ [0, 1].
-    word_info_lost          WIL = 1 − WIP.
-    estimated_cost_usd      Cost estimate based on config $/min and audio duration.
-    confidence              Average word confidence [0, 1] if provided by the engine API.
-
-    Extended metrics (controlled by MetricsConfig feature flags)
-    -----------------------------------------------------------
-    norm_word_error_rate    WER computed after number/amount normalisation.
-    term_error_rate         TNER — domain lexicon term miss rate (requires lexicon).
-    hallucination_rate      HAR — fraction of hypothesis words absent from reference.
-    punctuation_f1_macro    Macro F1 over {COMMA, PERIOD, QUESTION, EXCLAM}.
-    punctuation_error_rate  PPER — weighted punctuation placement error rate.
-
-
-    Diarization-specific
-    --------------------
-    num_speakers            Distinct speaker labels found (diarization engines only).
-    diarization_error_rate
-    jaccard_error_rate
-    """
-
-    # ── Infrastructure ────────────────────────────────────────────────────────
-    latency_sec: float = 0.0
-    audio_duration_sec: float = 0.0
-    ## start modif ##
-    time_to_first_token_sec: float | None = None   # NEW: TTFW for streaming engines
-    ## end modif ##
-    real_time_factor: float = 0.0
-    estimated_cost_usd: float = 0.0
-    confidence: float | None = None
-
-    # ── Standard accuracy ─────────────────────────────────────────────────────
-    word_error_rate: float | None = None
-    word_accuracy: float | None = None
-    character_error_rate: float | None = None
-    insertions: int | None = None
-    deletions: int | None = None
-    substitutions: int | None = None
-    match_error_rate: float | None = None
-    word_info_preserved: float | None = None
-    word_info_lost: float | None = None
-
-    # ── Extended accuracy ─────────────────────────────────────────────────────
-    norm_word_error_rate: float | None = None  
-    ## start modif ##
-    onset_wer: float | None = None                 # NEW: First-N WER   
-    ## end modif ##
-
-    # ── Domain / semantic ─────────────────────────────────────────────────────
-    term_error_rate: float | None = None
-    hallucination_rate: float | None = None
-
-    # ── Punctuation ───────────────────────────────────────────────────────────
-    punctuation_f1_macro: float | None = None
-    punctuation_error_rate: float | None = None
-
-    # ── Diarization ───────────────────────────────────────────────────────────
-    num_speakers: int | None = None
-    ## diar modif ##
-    diarization_error_rate: float | None = None
-    jaccard_error_rate: float | None = None
-    ## diar modif ##
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+class BaseReporter(abc.ABC):
+    @abc.abstractmethod
+    def write(self, results: Sequence[TranscriptionResult]) -> None:
+        """Persist or display the benchmark results."""
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Result
+# JSON reporter
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-@dataclass
-class TranscriptionResult:
-    """
-    Complete record for one (engine × audio-file) benchmarking cell.
+class JSONReporter(BaseReporter):
+    """Writes structured JSON with per-engine aggregate statistics."""
 
-    Attributes
-    ----------
-    engine_id            Unique identifier matching EngineConfig.engine_id.
-    engine_type          Canonical engine type string.
-    audio_file           Stem of the input .wav file.
-    hypothesis           Flat transcription text (used for WER/CER/all metrics).
-    reference            Gold-standard transcript if provided, else None.
-    metrics              Computed TranscriptionMetrics for this result.
-    diarization_segments Speaker-segmented output (diarization engines only).
-    error                Exception message if the attempt failed.
-    raw_response         Optional raw API response payload for debugging.
-    timestamp_utc        ISO-8601 timestamp of when the attempt started.
-    """
+    def __init__(self, output_path: Path) -> None:
+        self.output_path = output_path
 
-    engine_id: str
-    engine_type: str
-    audio_file: str
-    hypothesis: str
-    reference: str | None
-    metrics: TranscriptionMetrics
-    diarization_segments: list[DiarizationSegment] = field(default_factory=list)
-    error: str | None = None
-    raw_response: dict | None = field(default=None, repr=False)
-    timestamp_utc: str = ""
+    def write(self, results: Sequence[TranscriptionResult]) -> None:
+        serialised = []
+        for r in results:
+            row = r.to_dict()
+            if r.has_diarization:
+                row["diarization_segments"] = [s.to_dict() for s in r.diarization_segments]
+            serialised.append(row)
 
-    @property
-    def success(self) -> bool:
-        return self.error is None and bool(self.hypothesis)
-
-    @property
-    def has_diarization(self) -> bool:
-        return len(self.diarization_segments) > 0
-
-    @property
-    def diarization_transcript(self) -> str:
-        return "\n".join(seg.format_line() for seg in self.diarization_segments)
-
-    def to_dict(self) -> dict[str, Any]:
-        """Flatten to a single dictionary suitable for CSV / JSON export."""
-        d: dict[str, Any] = {
-            "engine_id": self.engine_id,
-            "engine_type": self.engine_type,
-            "audio_file": self.audio_file,
-            "timestamp_utc": self.timestamp_utc,
-            "success": self.success,
-            "hypothesis": self.hypothesis,
-            "reference": self.reference,
-            "error": self.error,
-            "diarization_transcript": self.diarization_transcript if self.has_diarization else "",
+        output = {
+            "summary": _build_summary(results),
+            "results": serialised,
         }
-        d.update(self.metrics.to_dict())
-        return d
+        self.output_path.write_text(
+            json.dumps(output, indent=2, ensure_ascii=False, default=str),
+            encoding="utf-8",
+        )
+        log.info("JSON results written to: %s", self.output_path)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CSV reporter
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class CSVReporter(BaseReporter):
+    """Flat CSV — one row per (engine × file) cell."""
+
+    def __init__(self, output_path: Path) -> None:
+        self.output_path = output_path
+
+    def write(self, results: Sequence[TranscriptionResult]) -> None:
+        if not results:
+            log.warning("No results to write to CSV.")
+            return
+        rows = [r.to_dict() for r in results]
+        fieldnames = list(rows[0].keys())
+        with open(self.output_path, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        log.info("CSV results written to: %s", self.output_path)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Excel reporter
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class ExcelReporter(BaseReporter):
+    """Polished Excel workbook: Summary Dashboard + Detailed Results tabs."""
+
+    def __init__(self, output_path: Path) -> None:
+        self.output_path = output_path
+
+    def write(self, results: Sequence[TranscriptionResult]) -> None:
+        try:
+            import pandas as pd
+            # Ensure Workbook is imported from openpyxl
+            from openpyxl import Workbook 
+            from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+            from openpyxl.utils.dataframe import dataframe_to_rows
+        except ImportError:
+            log.error(
+                "pandas or openpyxl not installed. Run: pip install pandas openpyxl"
+            )
+            return
+
+        if not results:
+            log.warning("No results to write to Excel.")
+            return
+
+        summary = _build_summary(results)
+        
+        summary_rows = []
+        for eid, stats in summary.items():
+            row = stats.copy()
+
+            summary_rows.append({"Engine": eid, **row})
+
+        import pandas as pd
+        df_summary = pd.DataFrame(summary_rows)
+        df_detailed = pd.DataFrame([r.to_dict() for r in results])
+
+        # 2. Now initialize the Workbook
+        from openpyxl import Workbook
+        wb = Workbook()
+        ws_summary = wb.active
+        ws_summary.title = "Summary Dashboard"
+        ws_detailed = wb.create_sheet(title="Detailed Results")
+
+        # Percentage columns (format as 0.00%)
+        ## start modif ##
+        PCT_KEYS = {
+            "wer", "cer", "mer", "wip", "wil", "tner", "har",
+            "norm_wer", "rate", "onset_wer", "jer"
+        } ## diar modif ##
+        ## end modif ##
+
+
+        # Currency columns
+        USD_KEYS = {"usd", "cost"}
+
+        def _is_pct(col_name: str) -> bool:
+            return any(k in col_name.lower() for k in PCT_KEYS)
+
+        def _is_usd(col_name: str) -> bool:
+            return any(k in col_name.lower() for k in USD_KEYS)
+
+        def format_sheet(ws, df) -> None:
+            header_fill  = PatternFill("solid", fgColor="2F4F4F")
+            alt_fill     = PatternFill("solid", fgColor="F9F9F9")
+            header_font  = Font(color="FFFFFF", bold=True)
+            thin = Side(style="thin", color="D3D3D3")
+            border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+            for r_idx, row in enumerate(dataframe_to_rows(df, index=False, header=True), 1):
+                ws.append(row)
+                for c_idx, cell in enumerate(ws[r_idx], 1):
+                    cell.border = border
+                    if r_idx == 1:
+                        cell.fill = header_fill
+                        cell.font = header_font
+                        cell.alignment = Alignment(horizontal="center", vertical="center")
+                    else:
+                        cell.alignment = Alignment(vertical="center")
+                        if r_idx % 2 == 0:
+                            cell.fill = alt_fill
+                        col_name = str(df.columns[c_idx - 1])
+                        if isinstance(cell.value, float):
+                            if _is_pct(col_name):
+                                cell.number_format = "0.00%"
+                            elif _is_usd(col_name):
+                                cell.number_format = '$#,##0.0000'
+                            elif any(k in col_name.lower() for k in ("rtf", "latency", "f1", "pper")):
+                                cell.number_format = "0.0000"
+
+            # Auto-fit columns
+            for col in ws.columns:
+                max_len = max(
+                    (len(str(cell.value)) for cell in col if cell.value is not None),
+                    default=10,
+                )
+                ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 50)
+
+            ws.auto_filter.ref = ws.dimensions
+
+        format_sheet(ws_summary, df_summary)
+        ws_summary.freeze_panes = "A2"
+        format_sheet(ws_detailed, df_detailed)
+        ws_detailed.freeze_panes = "C2"
+
+        wb.save(self.output_path)
+        log.info("Excel results written to: %s", self.output_path)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Console reporter
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class ConsoleReporter(BaseReporter):
+    """
+    Formatted summary table printed to stdout.
+
+    """
+
+    def write(self, results: Sequence[TranscriptionResult]) -> None:
+        summary = _build_summary(results)
+        if not summary:
+            print("No results to display.")
+            return
+
+        ## start modif ##
+        col_w   = [22, 5, 7, 6, 5, 7, 8, 7, 7, 7, 7, 7, 9]
+        headers = ["Engine", "Files", "Lat(s)", "TTFW","RTF",  "WER", "NormWER",  "OnsetWER" , "MER", "WIP", "HAR", "TNER", "Cost"]
+        ## end modif ##
+
+        ## diar modif ##
+        col_w   = [22, 5, 7, 6, 5, 7, 8, 7, 7, 7, 7, 7, 7, 7, 9]
+        headers = ["Engine", "Files", "Lat(s)", "TTFW","RTF",  "WER", "NormWER",  "OnsetWER" , "MER", "WIP", "HAR", "TNER", "DER", "JER","Cost"]
+        ## diar modif ##
+
+        sep = "─" * (sum(col_w) + len(col_w) * 3 + 1)
+
+        print()
+        print("  Azure STT Benchmark v2 — Summary")
+        print(f"  {sep}")
+        print("  " + " │ ".join(h.ljust(w) for h, w in zip(headers, col_w)))
+        print(f"  {sep}")
+
+        for engine_id, stats in summary.items():
+            def fmt_pct(val):
+                return f"{val:.1%}" if val is not None else "N/A"
+
+            row_vals = [
+                engine_id[:col_w[0]],
+                str(stats["num_files"]),
+                f"{stats['avg_latency_sec']:.1f}" if stats["avg_latency_sec"] is not None else "N/A",
+                ## start modif ##
+                f"{stats['avg_ttfw_sec']:.2f}"    if stats.get("avg_ttfw_sec") is not None else "N/A",
+                ## end modif ##
+                f"{stats['avg_rtf']:.2f}"          if stats["avg_rtf"] is not None else "N/A",
+                fmt_pct(stats["avg_wer"]),
+                fmt_pct(stats["avg_norm_wer"]),
+                ## start modif ##
+                fmt_pct(stats["avg_onset_wer"]),
+                ## end modif ##
+                fmt_pct(stats["avg_mer"]),
+                fmt_pct(stats["avg_wip"]),
+                fmt_pct(stats["avg_har"]),
+                fmt_pct(stats["avg_tner"]),
+                fmt_pct(stats["avg_der"]),  ## diar modif ##
+                fmt_pct(stats["avg_jer"]),  ## diar modif ##
+                f"${stats['total_cost_usd']:.4f}",
+            ]
+            print("  " + " │ ".join(v.ljust(w) for v, w in zip(row_vals, col_w)))
+
+        print(f"  {sep}")
+
+
+        # Diarization transcripts
+        diar_results = [r for r in results if r.has_diarization]
+        if diar_results:
+            print()
+            print("  ── Diarization Transcripts " + "─" * 60)
+            for r in diar_results:
+                print(f"\n  [{r.engine_id}]  {r.audio_file}  "
+                      f"({r.metrics.num_speakers} speaker(s))\n")
+                for line in r.diarization_transcript.splitlines():
+                    print(f"    {line}")
+        print()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Shared aggregation 
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+
+def _build_summary(
+    results: Sequence[TranscriptionResult],
+) -> dict:
+    buckets: dict[str, list[TranscriptionResult]] = defaultdict(list)
+    for r in results:
+        buckets[r.engine_id].append(r)
+
+    summary = {}
+    for engine_id, rows in buckets.items():
+        successful = [r for r in rows if r.success]
+        n = len(successful)
+
+        def get_avg(attr: str) -> float | None:
+            vals = [
+                v for r in successful
+                if (v := getattr(r.metrics, attr)) is not None
+            ]
+            return _safe_mean(vals)
+
+        wer_vals = [
+            r.metrics.word_error_rate
+            for r in successful
+            if r.metrics.word_error_rate is not None
+        ]
+
+        entry: dict = {
+            "num_files": len(rows),
+            "num_successful": n,
+            "num_errors": len(rows) - n,
+
+            # Performance & cost
+            "avg_latency_sec": round(get_avg("latency_sec") or 0.0, 4),
+            ## start modif ##
+            "avg_ttfw_sec":    get_avg("time_to_first_token_sec"),  
+            ## end modif ##
+
+            "avg_rtf":         round(get_avg("real_time_factor") or 0.0, 4),
+            "total_cost_usd":  round(
+                sum(r.metrics.estimated_cost_usd for r in successful), 6
+            ),
+            "avg_confidence":  get_avg("confidence"),
+            "avg_speakers":    (
+                round(s) if (s := get_avg("num_speakers")) is not None else None
+            ),
+
+            # Standard accuracy
+            "avg_wer":      get_avg("word_error_rate"),
+            ## start modif ##
+            "avg_onset_wer": get_avg("onset_wer"),  
+            ## end modif ##
+            "avg_onset_wer": get_avg("onset_wer"),
+            "avg_cer":      get_avg("character_error_rate"),
+            "avg_mer":      get_avg("match_error_rate"),
+            "avg_wip":      get_avg("word_info_preserved"),
+            "avg_wil":      get_avg("word_info_lost"),
+            "avg_norm_wer": get_avg("norm_word_error_rate"),
+
+            # Domain / semantic
+            "avg_tner":     get_avg("term_error_rate"),
+            "avg_har":      get_avg("hallucination_rate"),
+
+            # Punctuation & readability
+            "avg_punc_f1":  get_avg("punctuation_f1_macro"),
+            "avg_pper":     get_avg("punctuation_error_rate"),
+
+            ## diar modif ##
+            # Diarization
+            "avg_der":      get_avg("diarization_error_rate"),
+            "avg_jer":      get_avg("jaccard_error_rate"),
+            ## diar modif ##
+
+        }
+        summary[engine_id] = entry
+
+    return summary
+
+
+def _safe_mean(values: list[float]) -> float | None:
+    return sum(values) / len(values) if values else None
