@@ -1,416 +1,297 @@
 """
-data_loader.py
+metrics_meta.py
 ================
-Pure data-loading and parsing logic for the STT Benchmark Dashboard.
+Single source of truth for everything the dashboard needs to know about
+each canonical metric:
 
-Deliberately free of any Streamlit import so it can be unit-tested in
-isolation and reused outside the app (e.g. in a notebook or CI check).
+  * human-readable label and unit
+  * "lower is better" or "higher is better" direction
+  * thematic group (for grouping selectors and radar plots)
+  * a one-sentence tooltip/description
+  * display format (% vs raw vs seconds vs $)
 
-Expected on-disk layout::
+Import::
 
-    results/
-        <dataset_1>/
-            <source>_<dataset_1>.json
-            ...
-        <dataset_2>/
-            <source>_<dataset_2>.json
-            ...
-
-Each JSON file has the shape::
-
-    {
-      "summary": {
-        "<engine_id>": {"num_files": int, "avg_wer": float, ...},
-        ...
-      },
-      "results": [
-        {"engine_id": ..., "audio_file": ..., "word_error_rate": ..., ...},
-        ...
-      ]
-    }
+    from metrics_meta import METRICS, metric_label, metric_direction
 """
 
 from __future__ import annotations
-
-import json
-import re
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any
-
-import pandas as pd
-import yaml
-
-# ---------------------------------------------------------------------------
-# Naming-convention helpers
-# ---------------------------------------------------------------------------
-
-# Trailing tokens recognized as "feature flags" when auto-deriving tags from
-# a model identifier such as ``azure_speech_fr_diarize``. Purely a fallback
-# used when no explicit YAML category mapping is supplied for a model -
-# extend freely, order does not matter.
-KNOWN_FEATURE_TOKENS: dict[str, str] = {
-    "diarize": "Diarization",
-    "diarization": "Diarization",
-    "fr": "French",
-    "en": "English",
-    "multilingual": "Multilingual",
-    "streaming": "Streaming",
-    "stream": "Streaming",
-    "realtime": "Real-time",
-    "fast": "Fast",
-    "large": "Large",
-    "small": "Small",
-    "medium": "Medium",
-    "mini": "Mini",
-    "turbo": "Turbo",
-    "v1": "v1",
-    "v2": "v2",
-    "v3": "v3",
-    "beta": "Beta",
-}
 
 
-def parse_source_from_filename(file_path: Path, dataset_name: str) -> str:
-    """
-    Extract the ``source`` token from a results filename following the
-    ``<source>_<dataset>.json`` convention.
-
-    Falls back gracefully when the filename does not exactly match the
-    dataset name suffix (e.g. extra qualifiers), by trying the first
-    underscore-separated token instead.
-    """
-    stem = file_path.stem  # filename without .json
-    suffix = f"_{dataset_name}"
-    if stem.endswith(suffix) and len(stem) > len(suffix):
-        return stem[: -len(suffix)]
-    if "_" in stem:
-        return stem.split("_")[0]
-    return stem or "unknown"
+@dataclass(frozen=True)
+class MetricMeta:
+    key: str            # canonical short key matching data_loader.FIELD_MAP
+    label: str          # short human label (used in charts / table headers)
+    unit: str           # "", "%", "s", "x", "$", "speakers"
+    direction: str      # "lower" | "higher"
+    group: str          # thematic group name for organised selectors
+    description: str    # one-sentence tooltip
+    format: str         # Python format spec, e.g. ".2%" or ".3f"
+    tags: list[str] = field(default_factory=list)   # optional feature tags
 
 
-def make_model_key(source: str, engine_id: str) -> str:
-    """
-    Build the canonical ``<source>_<model_name>_<features>`` identifier used
-    throughout the dashboard and as the YAML category-mapping key.
-
-    If ``engine_id`` already starts with the source token (some pipelines
-    embed it, some don't - both appear in real benchmark exports) it is not
-    duplicated.
-    """
-    src = source.strip().lower()
-    eid = engine_id.strip()
-    if eid.lower() == src or eid.lower().startswith(src + "_") or eid.lower().startswith(src + "-"):
-        return eid
-    return f"{source}_{eid}"
-
-
-def split_model_key(model_key: str, source: str) -> tuple[str, list[str]]:
-    """
-    Best-effort split of a model key into a base ``model_name`` and a list
-    of recognized trailing ``features`` (see ``KNOWN_FEATURE_TOKENS``).
-    Used only for display/auto-tagging - never for identity/grouping.
-    """
-    tokens = model_key.split("_")
-    if tokens and tokens[0].lower() == source.strip().lower():
-        tokens = tokens[1:]
-    if not tokens:
-        return model_key, []
-
-    features: list[str] = []
-    while len(tokens) > 1:
-        candidate = tokens[-1].lower()
-        if candidate in KNOWN_FEATURE_TOKENS:
-            features.insert(0, KNOWN_FEATURE_TOKENS[candidate])
-            tokens.pop()
-        else:
-            break
-    model_name = "_".join(tokens) if tokens else model_key
-    return model_name, features
+# ── Accuracy ─────────────────────────────────────────────────────────────────
+_ACC = "Accuracy"
+# ── Punctuation ──────────────────────────────────────────────────────────────
+_PUN = "Punctuation"
+# ── Hallucination / Named Entities ───────────────────────────────────────────
+_HAL = "Hallucination & Terms"
+# ── Latency / Speed ──────────────────────────────────────────────────────────
+_SPD = "Speed & Latency"
+# ── Diarization ──────────────────────────────────────────────────────────────
+_DIA = "Diarization"
+# ── Cost ─────────────────────────────────────────────────────────────────────
+_CST = "Cost"
+# ── Misc ─────────────────────────────────────────────────────────────────────
+_MSC = "Misc"
 
 
-def auto_tags_from_model_key(model_key: str, source: str) -> list[str]:
-    """Convenience wrapper returning only the auto-derived feature tags."""
-    _, features = split_model_key(model_key, source)
-    return features
-
-
-# ---------------------------------------------------------------------------
-# Canonical metric field mapping
-# ---------------------------------------------------------------------------
-# Canonical short key -> (summary JSON field, per-file result JSON field)
-# A field of None means it has no counterpart in that record type.
-FIELD_MAP: dict[str, tuple[str | None, str | None]] = {
-    "latency_sec":   ("avg_latency_sec", "latency_sec"),
-    "ttfw_sec":      ("avg_ttfw_sec", "time_to_first_token_sec"),
-    "rtf":           ("avg_rtf", "real_time_factor"),
-    "cost_usd":      ("total_cost_usd", "estimated_cost_usd"),
-    "confidence":    ("avg_confidence", "confidence"),
-    "num_speakers":  ("avg_speakers", "num_speakers"),
-    "wer":           ("avg_wer", "word_error_rate"),
-    "onset_wer":     ("avg_onset_wer", "onset_wer"),
-    "cer":           ("avg_cer", "character_error_rate"),
-    "mer":           ("avg_mer", "match_error_rate"),
-    "wip":           ("avg_wip", "word_info_preserved"),
-    "wil":           ("avg_wil", "word_info_lost"),
-    "norm_wer":      ("avg_norm_wer", "norm_word_error_rate"),
-    "tner":          ("avg_tner", "term_error_rate"),
-    "har":           ("avg_har", "hallucination_rate"),
-    "punc_f1":       ("avg_punc_f1", "punctuation_f1_macro"),
-    "pper":          ("avg_pper", "punctuation_error_rate"),
-    "der":           ("avg_der", "diarization_error_rate"),
-    "jer":           ("avg_jer", "jaccard_error_rate"),
-}
-
-SUMMARY_EXTRA_FIELDS = ["num_files", "num_successful", "num_errors"]
-DETAIL_EXTRA_FIELDS = [
-    "audio_file", "timestamp_utc", "success", "error",
-    "hypothesis", "reference", "diarization_transcript",
-    "audio_duration_sec", "word_accuracy",
-    "insertions", "deletions", "substitutions",
+METRICS: list[MetricMeta] = [
+    # ── Accuracy ─────────────────────────────────────────────────────────────
+    MetricMeta(
+        key="wer", label="WER", unit="%", direction="lower", group=_ACC,
+        format=".2%",
+        description=(
+            "Word Error Rate — percentage of words in the reference that the model "
+            "inserted, deleted or substituted. The main accuracy metric for STT. "
+            "Lower is better."
+        ),
+    ),
+    MetricMeta(
+        key="norm_wer", label="Norm WER", unit="%", direction="lower", group=_ACC,
+        format=".2%",
+        description=(
+            "WER computed after text normalisation (lower-case, number expansion, "
+            "punctuation removal). More robust to capitalisation and formatting "
+            "differences. Lower is better."
+        ),
+    ),
+    MetricMeta(
+        key="cer", label="CER", unit="%", direction="lower", group=_ACC,
+        format=".2%",
+        description=(
+            "Character Error Rate — edit distance at the character level divided by "
+            "the reference character count. Useful for morphologically rich languages "
+            "or noisy audio. Lower is better."
+        ),
+    ),
+    MetricMeta(
+        key="mer", label="MER", unit="%", direction="lower", group=_ACC,
+        format=".2%",
+        description=(
+            "Match Error Rate — edit distance divided by the maximum of reference "
+            "and hypothesis lengths. Penalises both insertions and deletions "
+            "proportionally. Lower is better."
+        ),
+    ),
+    MetricMeta(
+        key="wip", label="WIP", unit="%", direction="higher", group=_ACC,
+        format=".2%",
+        description=(
+            "Word Information Preserved — proportion of word-level information from "
+            "the reference retained in the hypothesis. Complement of WIL. "
+            "Higher is better."
+        ),
+    ),
+    MetricMeta(
+        key="wil", label="WIL", unit="%", direction="lower", group=_ACC,
+        format=".2%",
+        description=(
+            "Word Information Lost — proportion of reference word information lost "
+            "in the hypothesis. Complement of WIP. Lower is better."
+        ),
+    ),
+    MetricMeta(
+        key="onset_wer", label="Onset WER", unit="%", direction="lower", group=_ACC,
+        format=".2%",
+        description=(
+            "WER restricted to the first word of each utterance / segment. "
+            "Measures how well the model captures sentence beginnings, "
+            "which are critical for downstream parsing. Lower is better."
+        ),
+    ),
+    # ── Hallucination / Terms ────────────────────────────────────────────────
+    MetricMeta(
+        key="har", label="Hallucination Rate", unit="%", direction="lower", group=_HAL,
+        format=".2%",
+        description=(
+            "Proportion of hypothesis words that have no reference counterpart "
+            "(pure insertions) — proxy for hallucinated content. Lower is better."
+        ),
+    ),
+    MetricMeta(
+        key="tner", label="Term Error Rate", unit="%", direction="lower", group=_HAL,
+        format=".2%",
+        description=(
+            "Named-Entity / Term Error Rate — WER restricted to a domain vocabulary "
+            "(product names, proper nouns, etc.). Directly measures business-critical "
+            "recognition quality. Lower is better."
+        ),
+    ),
+    # ── Punctuation ──────────────────────────────────────────────────────────
+    MetricMeta(
+        key="punc_f1", label="Punctuation F1", unit="", direction="higher", group=_PUN,
+        format=".3f",
+        description=(
+            "Macro-averaged F1 over punctuation classes (period, comma, question "
+            "mark, …). Measures how accurately the model restores sentence boundaries. "
+            "Higher is better."
+        ),
+    ),
+    MetricMeta(
+        key="pper", label="Punctuation Error Rate", unit="%", direction="lower", group=_PUN,
+        format=".2%",
+        description=(
+            "Rate of punctuation errors relative to the reference. "
+            "Complements Punctuation F1 with an error-count perspective. "
+            "Lower is better."
+        ),
+    ),
+    # ── Diarization ──────────────────────────────────────────────────────────
+    MetricMeta(
+        key="der", label="DER", unit="%", direction="lower", group=_DIA,
+        format=".2%",
+        description=(
+            "Diarization Error Rate — fraction of audio time incorrectly attributed "
+            "to a speaker (missed, false alarm, or confusion). "
+            "Only populated for diarization-capable engines. Lower is better."
+        ),
+        tags=["Diarization"],
+    ),
+    MetricMeta(
+        key="jer", label="JER", unit="%", direction="lower", group=_DIA,
+        format=".2%",
+        description=(
+            "Jaccard Error Rate — segment-level speaker assignment error based on "
+            "Jaccard distance between reference and hypothesis speaker sets. "
+            "Lower is better."
+        ),
+        tags=["Diarization"],
+    ),
+    # ── Speed & Latency ──────────────────────────────────────────────────────
+    MetricMeta(
+        key="latency_sec", label="Latency", unit="s", direction="lower", group=_SPD,
+        format=".2f",
+        description=(
+            "End-to-end wall-clock time from audio submission to full transcript "
+            "delivery (seconds). Includes network round-trip. Lower is better."
+        ),
+    ),
+    MetricMeta(
+        key="rtf", label="RTF", unit="x", direction="lower", group=_SPD,
+        format=".3f",
+        description=(
+            "Real-Time Factor — processing time divided by audio duration. "
+            "RTF < 1 means faster than real-time; RTF > 1 means slower. "
+            "Lower is better."
+        ),
+    ),
+    MetricMeta(
+        key="ttfw_sec", label="TTFW", unit="s", direction="lower", group=_SPD,
+        format=".2f",
+        description=(
+            "Time To First Word — latency from audio start to first recognised word "
+            "token (streaming engines only). Drives perceived responsiveness. "
+            "Lower is better."
+        ),
+        tags=["Streaming"],
+    ),
+    # ── Cost ─────────────────────────────────────────────────────────────────
+    MetricMeta(
+        key="cost_usd", label="Cost (USD)", unit="$", direction="lower", group=_CST,
+        format=".4f",
+        description=(
+            "Estimated total inference cost in US dollars for the evaluated audio "
+            "corpus, based on provider pricing at time of benchmark. Lower is better."
+        ),
+    ),
+    # ── Misc ─────────────────────────────────────────────────────────────────
+    MetricMeta(
+        key="confidence", label="Confidence", unit="", direction="higher", group=_MSC,
+        format=".3f",
+        description=(
+            "Average per-utterance confidence score returned by the engine "
+            "(0–1). Only populated for engines that expose confidence. "
+            "Higher is better."
+        ),
+    ),
 ]
 
+# ─── Fast lookup helpers ──────────────────────────────────────────────────────
 
-# ---------------------------------------------------------------------------
-# Discovery & loading
-# ---------------------------------------------------------------------------
+_BY_KEY: dict[str, MetricMeta] = {m.key: m for m in METRICS}
 
-@dataclass
-class LoadIssue:
-    file_path: str
-    message: str
+_ALL_KEYS: list[str] = [m.key for m in METRICS]
 
+# Keys considered "primary" — always shown by default in overview views
+DEFAULT_PRIMARY_METRICS: list[str] = ["wer", "cer", "latency_sec", "rtf", "cost_usd", "punc_f1"]
 
-@dataclass
-class LoadResult:
-    summary_df: pd.DataFrame
-    detail_df: pd.DataFrame
-    issues: list[LoadIssue] = field(default_factory=list)
+# Keys useful for a radar/spider chart (pure quality scores, all on similar scales)
+DEFAULT_RADAR_METRICS: list[str] = ["wer", "cer", "punc_f1", "har", "tner", "onset_wer"]
 
+# Keys available on most models (exclude optional diarization/ttfw)
+CORE_ACCURACY_METRICS: list[str] = ["wer", "norm_wer", "cer", "mer", "wip", "wil", "onset_wer"]
 
-def discover_result_files(results_root: Path) -> list[tuple[str, Path]]:
-    """Return a list of (dataset_name, file_path) for every *.json under results_root/<dataset>/."""
-    found: list[tuple[str, Path]] = []
-    if not results_root.exists() or not results_root.is_dir():
-        return found
-    for dataset_dir in sorted(p for p in results_root.iterdir() if p.is_dir()):
-        for file_path in sorted(dataset_dir.glob("*.json")):
-            found.append((dataset_dir.name, file_path))
-    return found
+# Grouped index: group_name -> list[MetricMeta]
+METRICS_BY_GROUP: dict[str, list[MetricMeta]] = {}
+for _m in METRICS:
+    METRICS_BY_GROUP.setdefault(_m.group, []).append(_m)
+
+# Group display order (controls the order sections appear in selectors)
+GROUP_ORDER: list[str] = [_ACC, _PUN, _HAL, _SPD, _DIA, _CST, _MSC]
+
+ALL_GROUPS: list[str] = [g for g in GROUP_ORDER if g in METRICS_BY_GROUP]
 
 
-def _safe_get(d: dict, key: str | None):
-    if key is None:
-        return None
-    return d.get(key)
+def get(key: str) -> MetricMeta | None:
+    return _BY_KEY.get(key)
 
 
-def load_results(results_root: str | Path) -> LoadResult:
-    """
-    Scan ``results_root`` and parse every JSON file into two tidy
-    long-format DataFrames: one row per (dataset, model) in ``summary_df``,
-    one row per (dataset, model, audio_file) in ``detail_df``.
-    """
-    results_root = Path(results_root)
-    summary_rows: list[dict[str, Any]] = []
-    detail_rows: list[dict[str, Any]] = []
-    issues: list[LoadIssue] = []
-
-    for dataset_name, file_path in discover_result_files(results_root):
-        try:
-            payload = json.loads(file_path.read_text(encoding="utf-8"))
-        except Exception as exc:  # noqa: BLE001 - surface any parse error to the UI
-            issues.append(LoadIssue(str(file_path), f"Could not parse JSON: {exc}"))
-            continue
-
-        source = parse_source_from_filename(file_path, dataset_name)
-        summary = payload.get("summary", {})
-        results = payload.get("results", [])
-
-        if not isinstance(summary, dict):
-            issues.append(LoadIssue(str(file_path), "'summary' key is not an object - skipped."))
-            summary = {}
-        if not isinstance(results, list):
-            issues.append(LoadIssue(str(file_path), "'results' key is not a list - skipped."))
-            results = []
-
-        for engine_id, entry in summary.items():
-            if not isinstance(entry, dict):
-                continue
-            model_key = make_model_key(source, engine_id)
-            model_name, auto_features = split_model_key(model_key, source)
-            row: dict[str, Any] = {
-                "dataset": dataset_name,
-                "source": source,
-                "engine_id": engine_id,
-                "model_key": model_key,
-                "model_name": model_name,
-                "auto_tags": auto_features,
-                "file_path": str(file_path),
-            }
-            for extra in SUMMARY_EXTRA_FIELDS:
-                row[extra] = entry.get(extra)
-            for canonical, (summary_field, _detail_field) in FIELD_MAP.items():
-                row[canonical] = _safe_get(entry, summary_field)
-            summary_rows.append(row)
-
-        for record in results:
-            if not isinstance(record, dict):
-                continue
-            engine_id = record.get("engine_id", "unknown")
-            model_key = make_model_key(source, engine_id)
-            model_name, auto_features = split_model_key(model_key, source)
-            row = {
-                "dataset": dataset_name,
-                "source": source,
-                "engine_id": engine_id,
-                "engine_type": record.get("engine_type"),
-                "model_key": model_key,
-                "model_name": model_name,
-                "auto_tags": auto_features,
-                "file_path": str(file_path),
-            }
-            for extra in DETAIL_EXTRA_FIELDS:
-                row[extra] = record.get(extra)
-            for canonical, (_summary_field, detail_field) in FIELD_MAP.items():
-                row[canonical] = _safe_get(record, detail_field)
-            # Keep the raw diarization segment list around for the transcript
-            # viewer, but as an opaque object - never flattened into metrics.
-            row["diarization_segments"] = record.get("diarization_segments")
-            detail_rows.append(row)
-
-    summary_df = pd.DataFrame(summary_rows)
-    detail_df = pd.DataFrame(detail_rows)
-    return LoadResult(summary_df=summary_df, detail_df=detail_df, issues=issues)
+def metric_label(key: str) -> str:
+    m = _BY_KEY.get(key)
+    return m.label if m else key
 
 
-# ---------------------------------------------------------------------------
-# Model metadata (YAML) loading
-# ---------------------------------------------------------------------------
-
-@dataclass
-class ModelMetadata:
-    models: dict[str, dict[str, Any]]
-    providers: dict[str, dict[str, Any]]
-    raw: dict[str, Any]
+def metric_direction(key: str) -> str:
+    m = _BY_KEY.get(key)
+    return m.direction if m else "lower"
 
 
-def load_model_metadata(yaml_path: str | Path | None) -> ModelMetadata:
-    """Load the optional model-categorization YAML. Returns an empty, valid
-    ModelMetadata object (never raises) when the file is missing or invalid,
-    so the rest of the dashboard can run uncategorized."""
-    if not yaml_path:
-        return ModelMetadata(models={}, providers={}, raw={})
-    path = Path(yaml_path)
-    if not path.exists():
-        return ModelMetadata(models={}, providers={}, raw={})
+def metric_format(key: str) -> str:
+    m = _BY_KEY.get(key)
+    return m.format if m else ".4f"
+
+
+def metric_group(key: str) -> str:
+    m = _BY_KEY.get(key)
+    return m.group if m else "Misc"
+
+
+def format_value(key: str, value: float | None, na: str = "—") -> str:
+    """Format a scalar metric value according to its display spec."""
+    if value is None or (isinstance(value, float) and value != value):  # NaN check
+        return na
+    m = _BY_KEY.get(key)
+    if m is None:
+        return f"{value:.4f}"
     try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except Exception:
-        return ModelMetadata(models={}, providers={}, raw={})
-    models = raw.get("models", {}) if isinstance(raw, dict) else {}
-    providers = raw.get("providers", {}) if isinstance(raw, dict) else {}
-    if not isinstance(models, dict):
-        models = {}
-    if not isinstance(providers, dict):
-        providers = {}
-    return ModelMetadata(models=models, providers=providers, raw=raw)
+        return format(value, m.format)
+    except (ValueError, TypeError):
+        return str(value)
 
 
-def parse_yaml_text(text: str) -> ModelMetadata:
-    """Same as load_model_metadata but from an in-memory string (used for
-    the sidebar file-uploader path). Never raises."""
-    try:
-        raw = yaml.safe_load(text) or {}
-    except Exception:
-        return ModelMetadata(models={}, providers={}, raw={})
-    models = raw.get("models", {}) if isinstance(raw, dict) else {}
-    providers = raw.get("providers", {}) if isinstance(raw, dict) else {}
-    if not isinstance(models, dict):
-        models = {}
-    if not isinstance(providers, dict):
-        providers = {}
-    return ModelMetadata(models=models, providers=providers, raw=raw)
-
-
-def lookup_model_metadata(meta: ModelMetadata, model_key: str, engine_id: str) -> dict[str, Any]:
+def normalize_series(key: str, series):
     """
-    Resolve metadata for a model with graceful fallbacks:
-    1. exact ``model_key`` match
-    2. case-insensitive ``model_key`` match
-    3. exact ``engine_id`` match (in case the YAML wasn't source-prefixed)
-    4. case-insensitive ``engine_id`` match
-    5. {} (uncategorized)
+    Return a 0-1 normalised pandas Series where 1.0 = best performance.
+    Handles direction automatically.
     """
-    if model_key in meta.models:
-        return meta.models[model_key] or {}
-    lower_map = {k.lower(): v for k, v in meta.models.items()}
-    if model_key.lower() in lower_map:
-        return lower_map[model_key.lower()] or {}
-    if engine_id in meta.models:
-        return meta.models[engine_id] or {}
-    if engine_id.lower() in lower_map:
-        return lower_map[engine_id.lower()] or {}
-    return {}
-
-
-def get_model_categories(meta: ModelMetadata, model_key: str, engine_id: str, auto_tags: list[str]) -> list[str]:
-    """Categories from YAML if present, otherwise fall back to auto-derived tags."""
-    entry = lookup_model_metadata(meta, model_key, engine_id)
-    cats = entry.get("categories")
-    if isinstance(cats, list) and cats:
-        return [str(c) for c in cats]
-    return list(auto_tags)
-
-
-def get_model_display_name(meta: ModelMetadata, model_key: str, engine_id: str, fallback: str) -> str:
-    entry = lookup_model_metadata(meta, model_key, engine_id)
-    name = entry.get("display_name")
-    return str(name) if name else fallback
-
-
-# ---------------------------------------------------------------------------
-# Enrichment helpers (attach YAML-derived columns to a loaded DataFrame)
-# ---------------------------------------------------------------------------
-
-def enrich_with_metadata(df: pd.DataFrame, meta: ModelMetadata) -> pd.DataFrame:
-    """Add category/display_name/provider columns derived from the YAML
-    metadata (with auto-tag fallback) to a summary or detail DataFrame."""
-    if df.empty:
-        df = df.copy()
-        df["categories"] = pd.Series(dtype=object)
-        df["display_name"] = pd.Series(dtype=object)
-        df["provider"] = pd.Series(dtype=object)
-        df["license"] = pd.Series(dtype=object)
-        return df
-
-    df = df.copy()
-    categories_col = []
-    display_col = []
-    provider_col = []
-    license_col = []
-    for _, row in df.iterrows():
-        entry = lookup_model_metadata(meta, row["model_key"], row["engine_id"])
-        cats = entry.get("categories")
-        if not (isinstance(cats, list) and cats):
-            cats = row.get("auto_tags") or []
-        categories_col.append([str(c) for c in cats])
-        display_col.append(entry.get("display_name") or row["model_key"])
-        provider_col.append(entry.get("provider") or row["source"])
-        license_col.append(entry.get("license"))
-    df["categories"] = categories_col
-    df["display_name"] = display_col
-    df["provider"] = provider_col
-    df["license"] = license_col
-    return df
-
-
-def all_categories(df: pd.DataFrame) -> list[str]:
-    """Flatten and de-duplicate the 'categories' list-column across a DataFrame."""
-    if df.empty or "categories" not in df.columns:
-        return []
-    seen: set[str] = set()
-    for cats in df["categories"]:
-        for c in cats or []:
-            seen.add(c)
-    return sorted(seen)
+    import pandas as pd
+    s = pd.to_numeric(series, errors="coerce")
+    mn, mx = s.min(), s.max()
+    if mn == mx or pd.isna(mn) or pd.isna(mx):
+        return s.fillna(0) * 0  # all-zero; avoids division by zero
+    if metric_direction(key) == "lower":
+        return 1 - (s - mn) / (mx - mn)
+    else:
+        return (s - mn) / (mx - mn)
