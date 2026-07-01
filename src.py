@@ -1,132 +1,111 @@
-# ─── TAB 2: Leaderboard ───────────────────────────────────────────────────────
+# ─── TAB 1: Overview ──────────────────────────────────────────────────────────
 
-def tab_leaderboard(s_df: pd.DataFrame, d_df: pd.DataFrame, filters: dict) -> None:
+def tab_overview(s_df: pd.DataFrame, d_df: pd.DataFrame, filters: dict) -> None:
     if s_df.empty:
         st.warning("No data matches the current filters.")
         return
 
-    sel_groups  = filters.get("sel_groups", ALL_GROUPS)
-    all_m_keys  = [m.key for g in sel_groups for m in METRICS_BY_GROUP.get(g, [])
-                   if m.key in s_df.columns]
-    avail_metrics = [k for k in all_m_keys if s_df[k].notna().any()]
-
-    # ── Horizontal Options Row (Above the Table) ──
-    section_label("Leaderboard Options")
-    opt_c1, opt_c2, opt_c3 = st.columns([2, 1, 1])
+    sel_groups = filters.get("sel_groups", ALL_GROUPS)
     
-    with opt_c1:
-        ranking_metrics = st.multiselect(
-            "Ranking metrics",
-            avail_metrics,
-            default=[k for k in DEFAULT_PRIMARY_METRICS if k in avail_metrics],
-            format_func=metric_label,
-        )
-    with opt_c2:
-        aggregate = st.selectbox(
-            "Aggregate across datasets by",
-            ["mean", "median", "best-run", "worst-run"],
-        )
-    with opt_c3:
-        n_models = s_df["model_key"].nunique()
-        top_n = st.slider("Top N models", min_value=1, max_value=n_models, value=min(10, n_models))
+    # Force core metrics to ensure both scatter charts work perfectly
+    base_keys = [m.key for g in sel_groups for m in METRICS_BY_GROUP.get(g, [])]
+    metric_keys = list(set(base_keys + ["wer", "latency_sec", "ttfw_sec", "cost_usd"]))
+    metric_keys = [k for k in metric_keys if k in s_df.columns]
 
-    if not ranking_metrics:
-        st.info("Select at least one ranking metric to view the leaderboard.")
-        return
+    # Aggregate across datasets (mean)
+    agg_df = _agg_summary(s_df, metric_keys, agg_fn="mean")
 
-    # Aggregation logic
-    if aggregate == "best-run":
-        agg_fn = {k: ("min" if metric_direction(k) == "lower" else "max") for k in avail_metrics}
-    elif aggregate == "worst-run":
-        agg_fn = {k: ("max" if metric_direction(k) == "lower" else "min") for k in avail_metrics}
-    else:
-        agg_fn = aggregate
+    # Filter out models by their Streaming tag
+    is_stream = agg_df["categories"].apply(lambda x: "Streaming" in x if isinstance(x, list) else "Streaming" in str(x))
+    df_stream = agg_df[is_stream]
+    df_non = agg_df[~is_stream]
 
-    agg_df = _agg_summary(s_df, avail_metrics, agg_fn=agg_fn)
-    ranked = _rank_df(agg_df, ranking_metrics).sort_values("composite_score", ascending=False).head(top_n).reset_index(drop=True)
+    has_wer = "wer" in agg_df.columns
 
-    # ── Full-Width Leaderboard Table ──
-    section_label("Leaderboard")
-    
-    display_df = ranked[["display_name", "source", "categories", "composite_score"] + ranking_metrics].copy()
-    display_df.insert(0, "Rank", [medal(i+1) for i in range(len(display_df))])
-    display_df["categories"] = display_df["categories"].apply(lambda x: ", ".join(x) if isinstance(x, list) else str(x))
-    display_df["composite_score"] = display_df["composite_score"] * 100
-
-    rename_map = {
-        "display_name": "Model",
-        "source": "Source",
-        "categories": "Categories",
-        "composite_score": "Composite Score (%)"
-    }
-    for m in ranking_metrics:
-        dir_arrow = "↓" if metric_direction(m) == "lower" else "↑"
-        rename_map[m] = f"{metric_label(m)} {dir_arrow}"
-        
-    display_df = display_df.rename(columns=rename_map)
-
-    def highlight_podium(s, direction):
-        ranks = s.rank(method='min', ascending=(direction == 'lower'))
-        styles = []
-        for r in ranks:
-            if pd.isna(r):
-                styles.append('')
-            elif r == 1:
-                styles.append(f'background-color: rgba(217, 119, 6, 0.15); font-weight: bold; color: {PALETTE["warn"]}')
-            elif r == 2:
-                styles.append(f'background-color: rgba(100, 116, 139, 0.15); font-weight: bold; color: {PALETTE["text_muted"]}')
-            elif r == 3:
-                styles.append(f'background-color: rgba(140, 99, 56, 0.15); font-weight: bold; color: #8c6338')
-            else:
-                styles.append('')
-        return styles
-
-    styler = display_df.style
-    styler = styler.apply(highlight_podium, direction="higher", subset=["Composite Score (%)"])
-    
-    for m in ranking_metrics:
-        col_name = rename_map[m]
-        styler = styler.apply(highlight_podium, direction=metric_direction(m), subset=[col_name])
-        
-    format_dict = {"Composite Score (%)": "{:.1f}%"}
-    for m in ranking_metrics:
-        fmt = get(m).format if get(m) else ".4f"
-        format_dict[rename_map[m]] = f"{{:{fmt}}}"
-        
-    styler = styler.format(format_dict, na_rep="—")
-
-    st.dataframe(styler, use_container_width=True, hide_index=True)
-
-    # ── Charts ──
-    global_color_map = _model_color_map(agg_df["display_name"].tolist())
-
+    # ── Accuracy vs Speed Scatter Plots ──
     c_left, c_right = st.columns(2)
     
     with c_left:
-        section_label("Composite score")
-        fig = bar_chart(
-            ranked, x="display_name", y="composite_score",
-            color_map={row["display_name"]: global_color_map[row["display_name"]] for _, row in ranked.iterrows()},
-            sort_asc=False, height=380, y_label="Composite score (0–1)",
-        )
-        st.plotly_chart(fig, use_container_width=True)
+        section_label("Non-Streaming Models (WER vs. Latency)")
+        if has_wer and "latency_sec" in df_non.columns and not df_non.empty:
+            plot_df = df_non.dropna(subset=["wer", "latency_sec"]).copy()
+            if not plot_df.empty:
+                has_cost = "cost_usd" in plot_df.columns and not plot_df["cost_usd"].isna().all()
+                if has_cost:
+                    plot_df["_bubble_size"] = plot_df["cost_usd"].fillna(0).clip(lower=0.0001)
+                
+                fig1 = px.scatter(
+                    plot_df, x="latency_sec", y="wer", color="source",
+                    size="_bubble_size" if has_cost else None,
+                    hover_name="display_name", text="display_name",
+                    labels={"latency_sec": "Avg. Latency (seconds)", "wer": "Avg. WER", "source": "Source"},
+                    size_max=30 if has_cost else 10
+                )
+                fig1.update_traces(
+                    textposition="top center", 
+                    textfont=dict(size=10, color=PALETTE["text_muted"]), 
+                    marker=dict(opacity=0.8, line=dict(width=1, color=PALETTE["bg_page"]))
+                )
+                fig1 = _chart_layout(fig1, height=420)
+                # Ideal corner annotation
+                fig1.add_annotation(
+                    x=plot_df["latency_sec"].min() * 0.9, y=plot_df["wer"].min() * 0.9,
+                    text="↙ Fast & Accurate", showarrow=False, font=dict(size=10, color=PALETTE["accent3"])
+                )
+                st.plotly_chart(fig1, use_container_width=True)
+            else:
+                st.info("Insufficient data to plot non-streaming models.")
+        else:
+            st.info("No non-streaming models selected, or missing WER/Latency data.")
 
     with c_right:
-        section_label("Per-metric breakdown")
-        sel_m = st.selectbox(
-            "Metric",
-            avail_metrics,
-            format_func=metric_label,
-            key="leaderboard_metric_select",
-            label_visibility="collapsed" # Hide label to align better with the other chart
-        )
+        section_label("Streaming Models (WER vs. TTFW)")
+        if has_wer and "ttfw_sec" in df_stream.columns and not df_stream.empty:
+            plot_df2 = df_stream.dropna(subset=["wer", "ttfw_sec"]).copy()
+            if not plot_df2.empty:
+                has_cost = "cost_usd" in plot_df2.columns and not plot_df2["cost_usd"].isna().all()
+                if has_cost:
+                    plot_df2["_bubble_size"] = plot_df2["cost_usd"].fillna(0).clip(lower=0.0001)
+                
+                fig2 = px.scatter(
+                    plot_df2, x="ttfw_sec", y="wer", color="source",
+                    size="_bubble_size" if has_cost else None,
+                    hover_name="display_name", text="display_name",
+                    labels={"ttfw_sec": "Avg. Time to First Word (sec)", "wer": "Avg. WER", "source": "Source"},
+                    size_max=30 if has_cost else 10
+                )
+                fig2.update_traces(
+                    textposition="top center", 
+                    textfont=dict(size=10, color=PALETTE["text_muted"]), 
+                    marker=dict(opacity=0.8, line=dict(width=1, color=PALETTE["bg_page"]))
+                )
+                fig2 = _chart_layout(fig2, height=420)
+                # Ideal corner annotation
+                fig2.add_annotation(
+                    x=plot_df2["ttfw_sec"].min() * 0.9, y=plot_df2["wer"].min() * 0.9,
+                    text="↙ Fast & Accurate", showarrow=False, font=dict(size=10, color=PALETTE["accent3"])
+                )
+                st.plotly_chart(fig2, use_container_width=True)
+            else:
+                st.info("Insufficient data to plot streaming models.")
+        else:
+            st.info("No streaming models selected, or missing TTFW data.")
+
+    # ── Per-dataset WER bar ──
+    if s_df["dataset"].nunique() > 1 and has_wer:
+        section_label("WER by model × dataset")
+        pivot = s_df.pivot_table(index="display_name", columns="dataset", values="wer", aggfunc="mean")
         
-        plot_df = agg_df.dropna(subset=[sel_m]).sort_values(sel_m, ascending=(metric_direction(sel_m) == "lower"))
-        fig2 = bar_chart(
-            plot_df,
-            x="display_name", y=sel_m,
-            color_map={row["display_name"]: global_color_map[row["display_name"]] for _, row in plot_df.iterrows()},
-            height=380,
-            y_label=f"{metric_label(sel_m)} ({direction_arrow(sel_m)})",
-        )
-        st.plotly_chart(fig2, use_container_width=True)
+        fig3 = go.Figure()
+        
+        for dataset_col in pivot.columns:
+            fig3.add_trace(go.Bar(
+                name=dataset_col, x=pivot.index, y=pivot[dataset_col],
+                text=[format_value("wer", v) for v in pivot[dataset_col]],
+                textposition="outside",
+                textfont=dict(size=10),
+            ))
+            
+        fig3.update_layout(barmode="group")
+        fig3 = _chart_layout(fig3, height=450)
+        st.plotly_chart(fig3, use_container_width=True)
